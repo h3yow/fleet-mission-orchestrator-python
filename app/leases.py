@@ -219,18 +219,18 @@ class LeaseManager:
 
     # --------------- 回收 ---------------
     def reclaim(self, task_id: str, reason: str) -> Lease:
+        task = self._task_after(task_id)
+        if task.state in (TaskState.COMPLETED, TaskState.FAILED):
+            raise DomainError(
+                RejectCode.TASK_INVALID_TRANSITION,
+                f"任务 {task_id} 已终态 {task.state.value}，不可回收")
         lease_id = self._active_by_task.get(task_id)
         lease = self._leases.get(lease_id) if lease_id else None
-        task = self._task_after(task_id)
         if lease is None:
             # 无 ACTIVE 租约：幂等安全返回（可能已被并发回收）
             raise DomainError(
                 RejectCode.TASK_NOT_CLAIMABLE,
                 f"任务 {task_id} 当前无 ACTIVE 租约可回收")
-        if task.state in (TaskState.COMPLETED, TaskState.FAILED):
-            raise DomainError(
-                RejectCode.TASK_INVALID_TRANSITION,
-                f"任务 {task_id} 已终态 {task.state.value}，不可回收")
         now = self.clock.now_ms()
         self._publish(EventType.TASK_RECLAIMED, {
             "task_id": task_id, "robot_id": lease.robot_id,
