@@ -190,6 +190,19 @@ class RobotRegistry:
         elif event_type == EventType.ROBOT_DEREGISTERED:
             robot.state = RobotState.DEREGISTERED
             robot.current_task_id = None
+        elif event_type == EventType.TASK_CLAIMED:
+            # 机器人当前持有的任务（单机器人单任务）
+            holder = self._robots.get(data.get("robot_id"))
+            if holder is not None:
+                holder.current_task_id = data.get("task_id")
+        elif event_type in (EventType.TASK_COMPLETED,
+                            EventType.TASK_FAILED,
+                            EventType.TASK_RECLAIMED,
+                            EventType.TASK_PREEMPTED):
+            holder = self._robots.get(data.get("robot_id"))
+            if holder is not None and holder.current_task_id == data.get(
+                    "task_id"):
+                holder.current_task_id = None
         robot.unknown_fields.update(unknown)
 
 
