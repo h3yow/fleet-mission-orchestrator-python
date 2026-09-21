@@ -71,11 +71,20 @@ class Scheduler:
             raise DomainError(
                 RejectCode.ROBOT_UNAVAILABLE,
                 f"机器人 {robot_id} 已注销，不得领取任务")
-        if robot.state != RobotState.REGISTERED:
+        if robot.state == RobotState.DRAINING:
+            raise DomainError(
+                RejectCode.ROBOT_UNAVAILABLE,
+                f"机器人 {robot_id} 处于排空（DRAINING）状态，"
+                "不领取新任务（可继续完成手头任务）")
+        if robot.state == RobotState.STALE:
             raise DomainError(
                 RejectCode.ROBOT_STALE,
-                f"机器人 {robot_id} 状态 {robot.state.value}，"
+                f"机器人 {robot_id} 心跳超时（STALE），"
                 "需先恢复心跳（REGISTERED）方可领取")
+        if robot.state != RobotState.REGISTERED:
+            raise DomainError(
+                RejectCode.ROBOT_UNAVAILABLE,
+                f"机器人 {robot_id} 状态 {robot.state.value}，不可领取任务")
         if robot.current_task_id is not None:
             raise DomainError(
                 RejectCode.ROBOT_UNAVAILABLE,
@@ -233,6 +242,16 @@ class Scheduler:
 
     def _reclaim_with_retry(self, lease: Lease, task: Task,
                             reason: str) -> list[Decision]:
+        # 资源边界：把“在途（持有中）+ 排队”统一视为系统积压。
+        # 回收重试用的任务当前由本机器人持有（不计 queue_size），
+        # 故回队前必须保证 queue_size 已达上限时显式拒绝，杜绝无界积压。
+        if task.attempt <= task.max_retries:
+            if self.tasks.queue_size() >= self.config.max_queue_size:
+                raise DomainError(
+                    RejectCode.QUEUE_FULL,
+                    f"任务 {task.task_id} 因 {reason} 需回收重试，"
+                    f"但排队积压已达上限 {self.config.max_queue_size}；"
+                    "拒绝重新入队以避免无界占用资源（调用方需扩容/降级）")
         # 回收（旧 token 失效，任务带进度回队）
         self.leases.reclaim(task.task_id, reason)
         if task.attempt <= task.max_retries:

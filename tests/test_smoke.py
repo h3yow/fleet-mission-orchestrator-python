@@ -1,4 +1,4 @@
-"""骨架冒烟测试：确认所有模块可导入、应用可装配。"""
+"""冒烟测试：确认所有模块可导入、应用可装配。"""
 from fastapi.testclient import TestClient
 
 import main
@@ -16,4 +16,4 @@ def test_root_endpoint():
     client = TestClient(main.app)
     resp = client.get("/")
     assert resp.status_code == 200
-    assert resp.json() == {"Hello": "World"}
+    assert resp.json()["service"] == "fleet-mission-orchestrator"
