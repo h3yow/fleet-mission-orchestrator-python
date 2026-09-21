@@ -54,6 +54,8 @@ class TaskManager:
         # 堆项: (-priority, 抢占续跑组(0)或普通组(1), 入队序号, task_id)
         self._heap: list[tuple[int, int, int, str]] = []
         self._queued_ids: set[str] = set()
+        # 每个在队任务“当前有效”的堆项键，旧堆项据此失效（重入队安全）
+        self._heap_key: dict[str, tuple[int, int, int]] = {}
         self._enq_counter = 0
 
     # ---------------- 下发 ----------------
@@ -121,24 +123,41 @@ class TaskManager:
             raise DomainError(
                 RejectCode.QUEUE_FULL,
                 f"任务队列已满（上限 {self.config.max_queue_size}），"
-                f"回收任务 {task_id} 无法重新入队")
+                f"任务 {task_id} 回队/入队被拒绝")
         self._enq_counter += 1
         group = 0 if resumed else 1
-        heapq.heappush(self._heap,
-                       (-task.priority, group, self._enq_counter, task_id))
+        key = (-task.priority, group, self._enq_counter)
+        self._heap_key[task_id] = key
+        heapq.heappush(self._heap, key + (task_id,))
         self._queued_ids.add(task_id)
 
+    def _is_live(self, item: tuple[int, int, int, str]) -> bool:
+        neg_pri, group, order, task_id = item
+        return (task_id in self._queued_ids
+                and self._heap_key.get(task_id) == (neg_pri, group, order))
+
     def queue_peek_order(self) -> list[str]:
-        """按调度顺序返回队中任务 ID（不弹出）。"""
-        return [tid for _, _, _, tid in sorted(self._heap)]
+        """按调度顺序返回在队任务 ID（不弹出，忽略失效旧堆项）。"""
+        return [tid for item in sorted(self._heap)
+                if self._is_live(item) for tid in [item[3]]]
 
     def queue_pop_id(self) -> str | None:
         while self._heap:
-            _, _, _, task_id = heapq.heappop(self._heap)
-            if task_id in self._queued_ids:
+            item = heapq.heappop(self._heap)
+            if self._is_live(item):
+                task_id = item[3]
                 self._queued_ids.discard(task_id)
+                self._heap_key.pop(task_id, None)
                 return task_id
         return None
+
+    def queue_take(self, task_id: str) -> bool:
+        """按 ID 取出指定排队任务（其堆项留待惰性清理）。成功返回 True。"""
+        if task_id not in self._queued_ids:
+            return False
+        self._queued_ids.discard(task_id)
+        self._heap_key.pop(task_id, None)
+        return True
 
     def queue_size(self) -> int:
         return len(self._queued_ids)

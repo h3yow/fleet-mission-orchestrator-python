@@ -174,6 +174,9 @@ class RobotRegistry:
 
         robot = self._robots.get(rid) if rid is not None else None
         if robot is None:
+            # 无 robot_id 顶层字段的事件（如 SCHEDULER_DECISION）与本投影无关
+            if rid is None:
+                return
             raise DomainError(
                 RejectCode.CORRUPT_RECORD,
                 f"事件 {event_type} 引用了未注册的机器人 {rid!r}")
