@@ -1,8 +1,8 @@
-from fastapi import FastAPI
+from fleet_orchestrator.api import create_app
 
-app = FastAPI()
+app = create_app()
 
 
 @app.get("/")
 def read_root():
-    return {"Hello": "World"}
+    return {"service": "fleet-mission-orchestrator", "docs": "/docs"}
