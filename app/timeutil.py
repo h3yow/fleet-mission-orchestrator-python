@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import time
 from typing import Protocol
 
 
@@ -13,21 +14,29 @@ class Clock(Protocol):
 
 
 class SystemClock:
+    """单调墙钟毫秒，生产使用。"""
+
     def now_ms(self) -> int:
-        raise NotImplementedError
+        # time.monotonic 只用于进程内超时判定；落盘时间戳另由调用方决定。
+        return int(time.monotonic() * 1000)
 
 
 class FakeClock:
-    """测试时钟：手动设置/推进时间。"""
+    """测试时钟：手动设置/推进时间，不会自行流逝。"""
 
     def __init__(self, start_ms: int = 0) -> None:
         self._now = start_ms
 
     def now_ms(self) -> int:
-        raise NotImplementedError
+        return self._now
 
     def advance(self, delta_ms: int) -> int:
-        raise NotImplementedError
+        if delta_ms < 0:
+            raise ValueError("delta_ms 不得为负")
+        self._now += delta_ms
+        return self._now
 
     def set(self, ms: int) -> None:
-        raise NotImplementedError
+        if ms < self._now:
+            raise ValueError("测试时钟不可倒流（避免破坏租约全序）")
+        self._now = ms
