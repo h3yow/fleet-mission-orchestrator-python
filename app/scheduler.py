@@ -19,7 +19,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, TYPE_CHECKING
 
 from .errors import DomainError, RejectCode
-from .models import Lease, LeaseState, Robot, RobotState, Task, TaskState
+from .models import Lease, LeaseState, RobotState, Task, TaskState
 from .storage import EventType, Storage
 from .timeutil import Clock
 

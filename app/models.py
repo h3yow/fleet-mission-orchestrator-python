@@ -18,7 +18,7 @@ DEFAULT_PRIORITY = 0
 DEFAULT_PREEMPTIBLE = True
 DEFAULT_MAX_RETRIES = 0
 DEFAULT_TASK_TIMEOUT_MS: int | None = None
-DEFAULT_PROGRESS: dict[str, Any] = None  # type: ignore[assignment]
+# progress 永远缺省为新的空 dict（见 Task.progress 的 default_factory）
 
 
 class TaskState(str, Enum):
