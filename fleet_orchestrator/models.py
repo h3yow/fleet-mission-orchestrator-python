@@ -21,13 +21,19 @@ class RobotStatus(str, enum.Enum):
 
 
 class MissionStatus(str, enum.Enum):
-    PENDING = "PENDING"        # 已下发，等待分配
+    PENDING = "PENDING"        # 已下发，依赖已满足，等待分配
+    WAITING = "WAITING"        # 已下发，仍有前置任务未成功，不可被领取
+    BLOCKED = "BLOCKED"        # 前置任务失败/取消导致不可执行（前置重试后可恢复）
     ASSIGNED = "ASSIGNED"      # 已建立租约，未开始执行
     RUNNING = "RUNNING"        # 执行中
     PREEMPTED = "PREEMPTED"    # 被抢占，保留进度，等待重分配
     SUCCEEDED = "SUCCEEDED"    # 完成（终态）
     FAILED = "FAILED"          # 失败（终态，可重试时回到 PENDING）
     CANCELLED = "CANCELLED"    # 取消（终态）
+
+
+# 前置任务尚未下发时，依赖查询中使用的占位状态
+DEP_MISSING = "MISSING"
 
 
 TERMINAL_STATES = frozenset(
@@ -38,6 +44,14 @@ TERMINAL_STATES = frozenset(
 MISSION_TRANSITIONS: dict[MissionStatus, frozenset[MissionStatus]] = {
     MissionStatus.PENDING: frozenset(
         {MissionStatus.ASSIGNED, MissionStatus.CANCELLED}
+    ),
+    MissionStatus.WAITING: frozenset(
+        # 依赖满足 -> 可领取；前置失败/取消 -> 被阻断；可主动取消
+        {MissionStatus.PENDING, MissionStatus.BLOCKED, MissionStatus.CANCELLED}
+    ),
+    MissionStatus.BLOCKED: frozenset(
+        # 前置回到等待 -> 继续等；前置重试并成功 -> 可领取；可主动取消
+        {MissionStatus.WAITING, MissionStatus.PENDING, MissionStatus.CANCELLED}
     ),
     MissionStatus.ASSIGNED: frozenset(
         {MissionStatus.RUNNING, MissionStatus.PENDING, MissionStatus.PREEMPTED,
@@ -90,6 +104,13 @@ class Mission(EvolveModel):
     enqueue_seq: int = 0
     # 租约代数（随任务持久化，回收/重启后仍单调递增，旧凭证可识别）
     lease_generation: int = 0
+    # ---- 依赖编排（新增字段均带默认值：老记录缺省视为无依赖）----
+    # 前置任务标识列表（去重保序）；允许引用尚未下发的任务
+    dependencies: list[str] = Field(default_factory=list)
+    # 被哪个前置任务拖垮（仅 BLOCKED 时有效），便于阻断传播归因
+    blocked_by: str | None = None
+    # 阻断原因码：dep_failed（前置终态失败）/ dep_cancelled（前置被取消）
+    blocked_reason: str | None = None
 
 
 class Lease(EvolveModel):

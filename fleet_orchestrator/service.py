@@ -15,11 +15,13 @@ import json
 import threading
 import time
 import uuid
+from collections import deque
 from typing import Any, Callable, Iterable
 
 from .config import SchedulerConfig
 from .errors import (
     BacklogFull,
+    DependencyCycle,
     InvalidStateTransition,
     LeaseExpired,
     LeaseNotHeld,
@@ -35,6 +37,7 @@ from .errors import (
     RobotNotFound,
 )
 from .models import (
+    DEP_MISSING,
     TERMINAL_STATES,
     Lease,
     Mission,
@@ -66,6 +69,7 @@ class OrchestratorService:
         self._missions: dict[str, Mission] = {}
         self._leases: dict[str, Lease] = {}  # key: mission_id
         self._load()
+        self._reconcile_dependencies()
 
     # ---------- 持久化 ----------
 
@@ -80,6 +84,40 @@ class OrchestratorService:
         self._leases = {
             k: Lease.model_validate(v) for k, v in state["leases"].items()
         }
+
+    def _reconcile_dependencies(self) -> None:
+        """恢复后对账：依据持久化的依赖图重算 WAITING/BLOCKED 状态。
+
+        按依赖深度自底向上收敛（深度有界，无环）。仅修正与推导不一致者，
+        绝不把 PENDING/PREEMPTED 等状态改成等待，因此不会凭空多出或吞掉
+        可领取任务。老记录无 dependencies 字段 -> 推导为 PENDING 不受影响，
+        但初始本就是 PENDING 的记录不会被改动。
+        """
+        fixed: list[tuple[str, dict[str, Any]]] = []
+        # 简单定长迭代：最深依赖链不超过任务总数，逐层收敛
+        for _ in range(max(1, len(self._missions))):
+            changed = False
+            for mission in self._missions.values():
+                if mission.status not in (
+                    MissionStatus.WAITING,
+                    MissionStatus.BLOCKED,
+                ):
+                    continue
+                target, blocker, reason = self._evaluate_dependencies(mission)
+                if (
+                    mission.status != target
+                    or mission.blocked_by != blocker
+                    or mission.blocked_reason != reason
+                ):
+                    mission.status = target  # 恢复对账直改，不经过状态机
+                    mission.blocked_by = blocker
+                    mission.blocked_reason = reason
+                    fixed.append(("mission_upsert", mission.model_dump(mode="json")))
+                    changed = True
+            if not changed:
+                break
+        if fixed:
+            self._persist(*fixed)
 
     def _persist(self, *events: tuple[str, dict[str, Any]]) -> None:
         for kind, record in events:
@@ -174,6 +212,119 @@ class OrchestratorService:
         robot.current_mission_id = mission.mission_id
         return lease
 
+    # ---------- 依赖编排 ----------
+
+    def _normalize_deps(self, dependencies: Iterable[str] | None) -> list[str]:
+        """去重、保序（sorted 保证指纹稳定）、丢弃空标识。"""
+        if not dependencies:
+            return []
+        return sorted({d for d in dependencies if d})
+
+    def _dep_status_value(self, dep_id: str) -> str:
+        dep = self._missions.get(dep_id)
+        return DEP_MISSING if dep is None else dep.status.value
+
+    def _has_cycle(self, mission_id: str, deps: list[str]) -> bool:
+        """在“已有依赖图 + 本次新边”上从 mission_id 出发 DFS 着色检测成环。
+
+        已有图在提交校验下保证无环；新成环的环必经过 mission_id。
+        尚未下发的前置标识视为出度为 0 的占位节点（先声明、后补建）。
+        """
+        adjacency: dict[str, list[str]] = {
+            mid: list(m.dependencies) for mid, m in self._missions.items()
+        }
+        adjacency[mission_id] = deps
+        white, gray, black = 0, 1, 2
+        color: dict[str, int] = {}
+        stack = [mission_id]
+        while stack:
+            node = stack[-1]
+            state = color.get(node, white)
+            if state == white:
+                color[node] = gray
+                for nxt in adjacency.get(node, ()):  # 未补建节点无出边
+                    nxt_state = color.get(nxt, white)
+                    if nxt_state == gray:
+                        return True
+                    if nxt_state == white:
+                        stack.append(nxt)
+            else:
+                if state == gray:
+                    color[node] = black
+                stack.pop()
+        return False
+
+    def _evaluate_dependencies(
+        self, mission: Mission
+    ) -> tuple[MissionStatus, str | None, str | None]:
+        """依据当前各前置任务状态推导任务应处状态。
+
+        返回 (status, blocked_by, blocked_reason)：
+        - 全部前置 SUCCEEDED            -> PENDING（可领取）
+        - 存在 FAILED/CANCELLED/BLOCKED -> BLOCKED（归因到拖垮链根因）
+        - 其余（未补建/等待/在执行/排队）-> WAITING
+        """
+        if not mission.dependencies:
+            return MissionStatus.PENDING, None, None
+        waiting = False
+        for dep_id in mission.dependencies:
+            dep = self._missions.get(dep_id)
+            if dep is None:
+                waiting = True
+                continue
+            if dep.status == MissionStatus.SUCCEEDED:
+                continue
+            if dep.status == MissionStatus.FAILED:
+                return MissionStatus.BLOCKED, dep_id, "dep_failed"
+            if dep.status == MissionStatus.CANCELLED:
+                return MissionStatus.BLOCKED, dep_id, "dep_cancelled"
+            if dep.status == MissionStatus.BLOCKED:
+                # 沿阻断链传播到根因；查询视图仍可见每个直接前置的状态
+                root = dep.blocked_by or dep_id
+                return MissionStatus.BLOCKED, root, dep.blocked_reason or "dep_failed"
+            waiting = True
+        if waiting:
+            return MissionStatus.WAITING, None, None
+        return MissionStatus.PENDING, None, None
+
+    def _refresh_dependents(
+        self, root_id: str, events: list[tuple[str, dict[str, Any]]]
+    ) -> None:
+        """root_id 状态变化后，级联重算依赖它的任务（仅 WAITING/BLOCKED 参与）。
+
+        BFS 逐层传播，单调用方已持锁，所有变更累计进同一批 events，
+        由外层一次性落盘，杜绝半更新与自相矛盾的中间状态。
+        无环图保证收敛；PENDING 及以后状态的任务不受影响。
+        """
+        reverse: dict[str, list[str]] = {}
+        for mid, m in self._missions.items():
+            for dep_id in m.dependencies:
+                reverse.setdefault(dep_id, []).append(mid)
+        queue: deque[str] = deque(reverse.get(root_id, ()))
+        while queue:
+            mid = queue.popleft()
+            mission = self._missions.get(mid)
+            if mission is None or mission.status not in (
+                MissionStatus.WAITING,
+                MissionStatus.BLOCKED,
+            ):
+                continue
+            target, blocker, reason = self._evaluate_dependencies(mission)
+            changed = (
+                mission.status != target
+                or mission.blocked_by != blocker
+                or mission.blocked_reason != reason
+            )
+            if not changed:
+                continue
+            if mission.status != target:
+                self._transition(mission, target)
+            mission.blocked_by = blocker
+            mission.blocked_reason = reason
+            events.append(("mission_upsert", mission.model_dump(mode="json")))
+            for child in reverse.get(mid, ()):
+                queue.append(child)
+
     # ---------- 机器人管理 ----------
 
     def register_robot(self, robot_id: str, capabilities: Iterable[str]) -> Robot:
@@ -235,16 +386,27 @@ class OrchestratorService:
         preemptible: bool = True,
         payload: dict[str, Any] | None = None,
         max_attempts: int | None = None,
+        dependencies: Iterable[str] | None = None,
     ) -> tuple[Mission, bool]:
         """返回 (mission, created)。同一 id 同内容幂等返回首次结果；
-        同 id 不同内容明确拒绝。"""
+        同 id 不同内容（含依赖声明不同）明确拒绝。
+
+        依赖规则：
+        - dependencies 允许引用尚未下发的任务标识（先声明、后补建）；
+        - 依赖全部 SUCCEEDED 才进入 PENDING；否则 WAITING；
+          前置 FAILED/CANCELLED/被阻断 -> BLOCKED；
+        - 自依赖或间接成环在下发时以 dependency_cycle 拒绝，不影响其它任务；
+        - 补建一个被等待的任务后，等待它的下游按规则同步重算。
+        """
         with self._lock:
+            deps = self._normalize_deps(dependencies)
             content = {
                 "required_capabilities": sorted(set(required_capabilities)),
                 "priority": int(priority),
                 "preemptible": bool(preemptible),
                 "payload": payload or {},
                 "max_attempts": max_attempts,
+                "dependencies": deps,
             }
             digest = _payload_hash(content)
             existing = self._missions.get(mission_id)
@@ -254,10 +416,19 @@ class OrchestratorService:
                 raise MissionPayloadConflict(
                     f"mission {mission_id!r} already submitted with different content"
                 )
+            if mission_id in deps or self._has_cycle(mission_id, deps):
+                raise DependencyCycle(
+                    f"mission {mission_id!r} dependencies form a cycle: {deps}"
+                )
             backlog = sum(
                 1
                 for m in self._missions.values()
-                if m.status in (MissionStatus.PENDING, MissionStatus.PREEMPTED)
+                if m.status in (
+                    MissionStatus.PENDING,
+                    MissionStatus.PREEMPTED,
+                    MissionStatus.WAITING,
+                    MissionStatus.BLOCKED,
+                )
             )
             if backlog >= self._config.max_backlog:
                 raise BacklogFull(
@@ -273,9 +444,19 @@ class OrchestratorService:
                 max_attempts=max_attempts or self._config.max_attempts_default,
                 created_at=self._now(),
                 enqueue_seq=next_seq,
+                dependencies=deps,
             )
+            initial, blocker, reason = self._evaluate_dependencies(mission)
+            mission.status = initial
+            mission.blocked_by = blocker
+            mission.blocked_reason = reason
             self._missions[mission_id] = mission
-            self._persist(("mission_upsert", mission.model_dump(mode="json")))
+            events: list[tuple[str, dict[str, Any]]] = [
+                ("mission_upsert", mission.model_dump(mode="json"))
+            ]
+            # 可能是“先声明、后补建”：补建后解阻/推进等待它的下游
+            self._refresh_dependents(mission_id, events)
+            self._persist(*events)
             return mission, True
 
     # ---------- 领取 / 执行 ----------
@@ -292,6 +473,7 @@ class OrchestratorService:
                 self._check_acquire_eligible(robot, mission)
                 candidates = [mission]
             else:
+                # 仅依赖已满足的任务可参与调度：WAITING/BLOCKED 不在候选内
                 candidates = [
                     m
                     for m in self._missions.values()
@@ -357,11 +539,14 @@ class OrchestratorService:
             self._transition(mission, MissionStatus.SUCCEEDED)
             self._release_lease(mission)
             robot = self._robots[robot_id]
-            self._persist(
+            events = [
                 ("mission_upsert", mission.model_dump(mode="json")),
                 ("lease_delete", {"mission_id": mission_id}),
                 ("robot_upsert", robot.model_dump(mode="json")),
-            )
+            ]
+            # 前置成功：级联解阻/推进依赖它的任务（同一批事件原子落盘）
+            self._refresh_dependents(mission_id, events)
+            self._persist(*events)
             return mission
 
     def fail_mission(
@@ -374,11 +559,14 @@ class OrchestratorService:
             self._transition(mission, MissionStatus.FAILED)
             self._release_lease(mission)
             robot = self._robots[robot_id]
-            self._persist(
+            events = [
                 ("mission_upsert", mission.model_dump(mode="json")),
                 ("lease_delete", {"mission_id": mission_id}),
                 ("robot_upsert", robot.model_dump(mode="json")),
-            )
+            ]
+            # 前置失败（终态）：依赖方阻断；若之后重试成功会按同规则恢复
+            self._refresh_dependents(mission_id, events)
+            self._persist(*events)
             return mission
 
     def renew_lease(self, robot_id: str, mission_id: str, lease_id: str) -> Lease:
@@ -408,7 +596,12 @@ class OrchestratorService:
                     f" >= max_attempts {mission.max_attempts}"
                 )
             self._transition(mission, MissionStatus.PENDING)
-            self._persist(("mission_upsert", mission.model_dump(mode="json")))
+            events: list[tuple[str, dict[str, Any]]] = [
+                ("mission_upsert", mission.model_dump(mode="json"))
+            ]
+            # 前置重回等待：之前被它阻断的依赖方按同样规则恢复（不再卡在 BLOCKED）
+            self._refresh_dependents(mission_id, events)
+            self._persist(*events)
             return mission
 
     def cancel_mission(self, mission_id: str) -> Mission:
@@ -427,6 +620,8 @@ class OrchestratorService:
                 robot = self._robots.get(lease.robot_id)
                 if robot is not None:
                     events.append(("robot_upsert", robot.model_dump(mode="json")))
+            # 前置取消：依赖方进入不可执行（dep_cancelled），不可领取/抢占/回收
+            self._refresh_dependents(mission_id, events)
             self._persist(*events)
             return mission
 
@@ -499,6 +694,8 @@ class OrchestratorService:
             robot = self._robots.get(lease.robot_id)
             if robot is not None:
                 events.append(("robot_upsert", robot.model_dump(mode="json")))
+        # 次数用尽 -> FAILED 终态时，依赖方须级联阻断（回到 PENDING 时刷新为无操作）
+        self._refresh_dependents(mission.mission_id, events)
 
     # ---------- 配置 ----------
 
@@ -527,6 +724,42 @@ class OrchestratorService:
         if status is not None:
             missions = [m for m in missions if m.status == status]
         return missions
+
+    def dependency_view(self, mission_id: str) -> dict[str, Any]:
+        """依赖等待视图：查询任务究竟卡在哪一步。
+
+        - 无依赖且 PENDING/PREEMPTED：wait_kind="schedule"（等待调度，非依赖）
+        - WAITING：wait_kind="dependency"，逐个列出前置状态（含未补建=MISSING），
+          unsatisfied 列出仍未成功的前置标识
+        - BLOCKED：wait_kind="blocked"，给出 blocked_by/blocked_reason
+        - 其它（在执行/终态）：wait_kind="none"
+        """
+        with self._lock:
+            mission = self._get_mission(mission_id)
+            dep_status = {d: self._dep_status_value(d) for d in mission.dependencies}
+            unsatisfied = [
+                d
+                for d in mission.dependencies
+                if dep_status[d] != MissionStatus.SUCCEEDED.value
+            ]
+            if mission.status == MissionStatus.BLOCKED:
+                wait_kind = "blocked"
+            elif mission.status == MissionStatus.WAITING:
+                wait_kind = "dependency"
+            elif mission.status in (MissionStatus.PENDING, MissionStatus.PREEMPTED):
+                wait_kind = "schedule"
+            else:
+                wait_kind = "none"
+            return {
+                "mission_id": mission_id,
+                "status": mission.status.value,
+                "wait_kind": wait_kind,
+                "dependencies": list(mission.dependencies),
+                "dependency_status": dep_status,
+                "unsatisfied": unsatisfied,
+                "blocked_by": mission.blocked_by,
+                "blocked_reason": mission.blocked_reason,
+            }
 
     def list_robots(self) -> list[Robot]:
         return sorted(self._robots.values(), key=lambda r: r.robot_id)

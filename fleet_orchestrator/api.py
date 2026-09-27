@@ -31,6 +31,8 @@ class SubmitMissionReq(BaseModel):
     preemptible: bool = True
     payload: dict[str, Any] = Field(default_factory=dict)
     max_attempts: int | None = None
+    # 前置任务标识，允许引用尚未下发的任务（先声明、后补建）
+    dependencies: list[str] = Field(default_factory=list)
 
 
 class AcquireReq(BaseModel):
@@ -98,7 +100,7 @@ def create_app(service: OrchestratorService | None = None) -> FastAPI:
     def submit_mission(req: SubmitMissionReq) -> Any:
         mission, created = service.submit_mission(
             req.mission_id, req.required_capabilities, req.priority,
-            req.preemptible, req.payload, req.max_attempts,
+            req.preemptible, req.payload, req.max_attempts, req.dependencies,
         )
         return {"created": created, "mission": mission}
 
@@ -153,6 +155,12 @@ def create_app(service: OrchestratorService | None = None) -> FastAPI:
     def get_lease(mission_id: str) -> Any:
         lease = service.get_lease(mission_id)
         return {"lease": lease}
+
+    @app.get("/missions/{mission_id}/dependencies")
+    def get_dependencies(mission_id: str) -> Any:
+        # 区分等待调度(schedule)/等待依赖(dependency)/被阻断(blocked)，
+        # 并列出每个前置的当前状态（尚未补建为 MISSING）
+        return service.dependency_view(mission_id)
 
     # ---- 运维 ----
 
