@@ -51,6 +51,13 @@ class MissionPayloadConflict(Rejection):
     http_status = 409
 
 
+class DependencyCycle(Rejection):
+    """依赖声明成环（直接或间接依赖回自身），下发被拒绝。"""
+
+    reason = "dependency_cycle"
+    http_status = 409
+
+
 # ---- 租约相关 ----
 
 class MissionNotFound(Rejection):

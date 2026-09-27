@@ -47,3 +47,20 @@ def test_rejection_reasons_over_http(client, case_log):
              actual=f"{r.status_code} {r.json()}")
     assert r.status_code == 422
     assert r.json()["error"] == "config_out_of_range"
+
+
+def test_dependencies_over_http(client, case_log):
+    r = client.post("/missions", json={"mission_id": "b", "depends_on": ["a"]})
+    assert r.status_code == 200
+    assert r.json()["mission"]["status"] == "WAITING_DEPS"
+    r = client.get("/missions/b/dependencies")
+    case_log("HTTP 依赖视图", expect="前置 a 显示 MISSING",
+             actual=r.json()["dependencies"])
+    assert r.json()["dependencies"] == [
+        {"mission_id": "a", "status": "MISSING", "satisfied": False}
+    ]
+    r = client.post("/missions", json={"mission_id": "c", "depends_on": ["c"]})
+    case_log("HTTP 成环拒绝", expect="409 dependency_cycle",
+             actual=f"{r.status_code} {r.json()}")
+    assert r.status_code == 409
+    assert r.json()["error"] == "dependency_cycle"

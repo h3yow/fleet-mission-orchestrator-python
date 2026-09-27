@@ -14,7 +14,7 @@ fleet_orchestrator/
   models.py                领域模型与状态机跳转表（extra="allow" 容忍未知字段）
   config.py                调度/超时参数，范围校验，非法整体拒绝
   errors.py                可区分拒绝原因（每个 reason 稳定且唯一）
-tests/                     49 个测试，覆盖超时、竞争、抢占、幂等、非法跳转、恢复
+tests/                     64 个测试，覆盖超时、竞争、抢占、幂等、依赖编排、恢复
 ```
 
 ## 任务状态机
@@ -28,6 +28,12 @@ PENDING ──> ASSIGNED ──> RUNNING ──> SUCCEEDED (终态)
   └───────────┴── 回收(reclaim, attempts 未用尽)
 ASSIGNED/RUNNING ──回收且次数用尽──> FAILED
 任意非终态 ──> CANCELLED (终态)
+
+依赖编排扩展：
+WAITING_DEPS ──依赖全部成功──> PENDING
+WAITING_DEPS ──前置失败/取消──> BLOCKED (记录 blocked_by)
+BLOCKED ──前置恢复(重试/解阻)──> WAITING_DEPS
+WAITING_DEPS / BLOCKED ──> CANCELLED
 ```
 
 - 非法跳转（如 ASSIGNED→SUCCEEDED、PENDING→RUNNING）抛出
@@ -66,6 +72,36 @@ ASSIGNED/RUNNING ──回收且次数用尽──> FAILED
   `preempt_target_not_running` / `preempt_priority_too_low`。
 - 积压控制：PENDING + PREEMPTED 数量达到 `max_backlog` 时新任务被拒绝
   （`backlog_full`, HTTP 429），不无界占用资源。
+
+## 任务依赖编排
+
+- 下发时可声明 `depends_on: [mission_id, ...]`，允许引用尚未下发的任务
+  （先声明、后补建）。缺省为空，等价于无依赖（老记录行为不变）。
+- 状态语义：**等待依赖**（`WAITING_DEPS`）与**等待调度**（`PENDING`）是
+  两个可区分的状态。只有全部前置任务 `SUCCEEDED`，任务才从
+  `WAITING_DEPS` 晋升为 `PENDING` 进入可领取范围；此前显式领取与自动
+  调度都不会选中它（`mission_not_assignable`）。
+- 查询：`GET /missions/{id}/dependencies` 返回每个前置任务的状态
+  （未出现的前置显示 `MISSING`）、是否已满足，以及任务当前被哪个前置
+  阻断（`blocked_by`）。
+- 成环拒绝：依赖关系直接或间接绕回自身（含自己依赖自己）在下发时
+  被拒绝，reason 为 `dependency_cycle`（HTTP 409），不影响其它任务，
+  也不留下半截记录。尚未下发的前置没有出边，不可能参与成环。
+- 阻断传播：前置任务进入 `FAILED` / `CANCELLED`（或自身被阻断）时，
+  依赖它的任务进入 `BLOCKED` 并记录 `blocked_by`（阻断沿依赖链传递）。
+  `BLOCKED` 任务不可领取、不可抢占、不持有租约，回收逻辑不会误把它
+  当作在执行。
+- 阻断恢复：前置经重试回到等待并最终成功时，被阻断的任务按同样规则
+  恢复（`BLOCKED -> WAITING_DEPS -> PENDING`）。所有依赖状态刷新在
+  同一把锁内随触发操作同事务持久化，无半更新、无自相矛盾的可见状态。
+- 容量约束：解阻晋升 `PENDING` 与下发共用同一 `max_backlog` 上限。
+  一个前置成功同时解阻一批任务时，按入队序号逐个晋升，槽位不足的任务
+  留在 `WAITING_DEPS` 排队（下次释放槽位时再评估），不得绕开上限
+  无界堆积。
+- 幂等：`depends_on` 参与内容指纹。同标识同依赖重复下发幂等返回首次
+  结果；依赖不同按 `mission_payload_conflict` 拒绝。
+- 持久化：`depends_on` / `blocked_by` / 新状态均随任务记录持久化，
+  重启恢复与事件重放后与故障前一致，不会凭空多出可领取任务。
 
 ## 配置项与上限
 
@@ -108,6 +144,7 @@ ASSIGNED/RUNNING ──回收且次数用尽──> FAILED
 | `POST /missions/{id}/retry` `/cancel` `/preempt` | 重试/取消/抢占 |
 | `POST /admin/sweep` `/admin/config` | 超时回收 / 配置 |
 | `GET /missions` `/robots` `/missions/{id}/lease` | 查询 |
+| `GET /missions/{id}/dependencies` | 依赖编排视图（前置状态/阻断来源） |
 
 所有拒绝返回 `{"error": <reason>, "detail": <说明>}`，reason 取值见
 `fleet_orchestrator/errors.py`。
@@ -115,7 +152,7 @@ ASSIGNED/RUNNING ──回收且次数用尽──> FAILED
 ## 验证方法
 
 ```bash
-uv run pytest tests/ -q          # 全部 49 个测试
+uv run pytest tests/ -q          # 全部 64 个测试
 uv run pytest tests/ -q -s       # 打印每个用例的输入与判定依据 ([CASE] 日志)
 uv run uvicorn main:app          # 启动服务，文档见 /docs
 ```
@@ -131,6 +168,7 @@ uv run uvicorn main:app          # 启动服务，文档见 /docs
 | 注册、能力与可用性 | `tests/test_robot_registration.py` |
 | 非法跳转与非持有者上报 | `tests/test_state_machine.py` |
 | 重启恢复与事件重放 | `tests/test_recovery.py` |
+| 依赖编排（等待/阻断/成环/容量/重放） | `tests/test_dependencies.py` |
 | 配置校验 | `tests/test_config.py` |
 | 数据格式演进 | `tests/test_evolution.py` |
 | HTTP 拒绝原因映射 | `tests/test_api.py` |
