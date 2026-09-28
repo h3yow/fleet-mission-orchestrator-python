@@ -14,7 +14,7 @@ from .errors import ConfigOutOfRange
 _BOUNDS: dict[str, tuple[float, float]] = {
     "lease_duration_s": (1.0, 3600.0),        # 租约时长
     "heartbeat_timeout_s": (1.0, 3600.0),     # 心跳超时判定
-    "max_backlog": (1.0, 100000.0),           # 待分配队列上限（防无界占用）
+    "max_backlog": (1.0, 100000.0),           # 统一积压配额：PENDING/PREEMPTED/WAITING_DEPS/BLOCKED 总数
     "max_attempts_default": (1.0, 100.0),     # 任务默认最大重试次数
     "max_lease_renewals": (0.0, 1000.0),      # 单次租约最大续约次数
     "renew_extension_s": (1.0, 3600.0),       # 每次续约延长时长

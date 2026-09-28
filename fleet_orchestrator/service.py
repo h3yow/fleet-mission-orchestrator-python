@@ -4,6 +4,10 @@
 - 所有变更操作在同一把可重入锁内完成，租约判定与状态迁移是原子的。
 - 不变量：mission 处于 ASSIGNED/RUNNING 当且仅当存在对应 lease；
   lease 存在则持有机器人的 current_mission_id 指向该 mission。
+- 积压配额不变量：PENDING/PREEMPTED/WAITING_DEPS/BLOCKED 共享同一
+  max_backlog。任何让任务新占配额的准入路径（submit/retry/preempt）都在
+  变更前过同一道容量守卫；同槽换状态（解阻、阻断传播与恢复）不改变计数。
+  唯一例外是失活租约的强制回收，可能瞬时 cap+1，领取后立即自愈。
 - 每次变更先写事件日志再写原子快照，重启后状态可完整恢复。
 - 时钟可注入，测试用假时钟确定性模拟心跳超时与租约过期。
 """
@@ -177,12 +181,33 @@ class OrchestratorService:
 
     # ---------- 依赖编排 ----------
 
+    # 占用同一份积压配额的状态：已接收但未在执行的任务全部计数，
+    # 包括等待调度(PENDING/PREEMPTED)、等待前置(WAITING_DEPS)、
+    # 被前置拖住不可执行(BLOCKED)。等待池不得绕开上限无界堆积。
+    _BACKLOG_STATUSES = frozenset(
+        {
+            MissionStatus.PENDING,
+            MissionStatus.PREEMPTED,
+            MissionStatus.WAITING_DEPS,
+            MissionStatus.BLOCKED,
+        }
+    )
+
     def _backlog_size(self) -> int:
         return sum(
-            1
-            for m in self._missions.values()
-            if m.status in (MissionStatus.PENDING, MissionStatus.PREEMPTED)
+            1 for m in self._missions.values() if m.status in self._BACKLOG_STATUSES
         )
+
+    def _ensure_capacity(self, extra: int = 1, via: str = "submit") -> None:
+        """准入守卫：任何让任务占用积压配额的路径共用同一条线。
+        调用方必须在任何状态变更之前调用，拒绝时不留下半截记录。"""
+        backlog = self._backlog_size()
+        if backlog + extra > self._config.max_backlog:
+            raise BacklogFull(
+                f"backlog {backlog} + {extra} > max_backlog "
+                f"{self._config.max_backlog} (via {via}); "
+                f"PENDING/PREEMPTED/WAITING_DEPS/BLOCKED share the quota"
+            )
 
     def _would_cycle(self, mission_id: str, deps: list[str]) -> bool:
         """沿已存在任务的 depends_on 边做可达性搜索，能绕回自身即成环。
@@ -226,8 +251,9 @@ class OrchestratorService:
 
         1) 阻断传播与恢复迭代至不动点（阻断可沿依赖链传递）：
            WAITING_DEPS 有失败前置 -> BLOCKED；BLOCKED 无失败前置 -> WAITING_DEPS。
-        2) 解除等待：依赖全部成功且积压未满 -> PENDING；
-           容量不足时留在 WAITING_DEPS 排队，不得绕开 max_backlog。
+        2) 解除等待：依赖全部成功 -> PENDING。
+           WAITING_DEPS/BLOCKED 在提交时已占用积压配额，状态互转不改变
+           配额计数，因此批量化解阻不可能把待分配集合撑到 max_backlog 之上。
         """
         events: list[tuple[str, dict[str, Any]]] = []
         ordered = sorted(self._missions.values(), key=lambda m: m.enqueue_seq)
@@ -248,16 +274,12 @@ class OrchestratorService:
                         self._transition(m, MissionStatus.WAITING_DEPS)
                         events.append(("mission_upsert", m.model_dump(mode="json")))
                         changed = True
-        backlog = self._backlog_size()
         for m in ordered:
             if m.status != MissionStatus.WAITING_DEPS:
                 continue
             if not self._deps_satisfied(m):
                 continue
-            if backlog >= self._config.max_backlog:
-                continue  # 容量不足：留在 WAITING_DEPS 排队，下次刷新再评估
             self._transition(m, MissionStatus.PENDING)
-            backlog += 1
             events.append(("mission_upsert", m.model_dump(mode="json")))
         return events
 
@@ -350,11 +372,8 @@ class OrchestratorService:
                 raise DependencyCycle(
                     f"mission {mission_id!r} dependencies form a cycle: {deps}"
                 )
-            backlog = self._backlog_size()
-            if backlog >= self._config.max_backlog:
-                raise BacklogFull(
-                    f"backlog {backlog} >= max_backlog {self._config.max_backlog}"
-                )
+            # 等待前置 / 被前置拖住的任务同样占用配额，先校验再落记录
+            self._ensure_capacity(via="submit")
             next_seq = max((m.enqueue_seq for m in self._missions.values()), default=-1) + 1
             mission = Mission(
                 mission_id=mission_id,
@@ -421,7 +440,8 @@ class OrchestratorService:
                 ("mission_upsert", mission.model_dump(mode="json")),
                 ("lease_upsert", lease.model_dump(mode="json")),
                 ("robot_upsert", robot.model_dump(mode="json")),
-                # 领取释放一个积压槽位，可能让排队等待容量的依赖任务晋升
+                # 领取不改变配额计数（执行态也不计）；刷新仍需执行，
+                # 以处理此前同事务内可能产生的阻断/解阻状态变化
                 *self._refresh_dependencies(),
             )
             return mission, lease
@@ -514,6 +534,9 @@ class OrchestratorService:
                     f"mission {mission_id!r} attempts {mission.attempts}"
                     f" >= max_attempts {mission.max_attempts}"
                 )
+            # FAILED 是终态不占配额，重试回到待分配前必须先拿到槽位；
+            # 守卫在任何状态变更之前，拒绝后任务仍停留在 FAILED。
+            self._ensure_capacity(via="retry")
             self._transition(mission, MissionStatus.PENDING)
             self._persist(
                 ("mission_upsert", mission.model_dump(mode="json")),
@@ -561,6 +584,9 @@ class OrchestratorService:
                         f"challenger priority {challenger.priority}"
                         f" <= target priority {mission.priority}"
                     )
+            # 执行态不占积压配额，被抢占后进入 PREEMPTED 需要一个槽位；
+            # 满队时按既有策略 backlog_full 拒绝，任务继续留在执行态。
+            self._ensure_capacity(via="preempt")
             events: list[tuple[str, dict[str, Any]]] = []
             lease = self._release_lease(mission)
             self._transition(mission, MissionStatus.PREEMPTED)  # progress 保留

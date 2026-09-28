@@ -14,7 +14,8 @@ fleet_orchestrator/
   models.py                领域模型与状态机跳转表（extra="allow" 容忍未知字段）
   config.py                调度/超时参数，范围校验，非法整体拒绝
   errors.py                可区分拒绝原因（每个 reason 稳定且唯一）
-tests/                     64 个测试，覆盖超时、竞争、抢占、幂等、依赖编排、恢复
+tests/                     76 个测试，覆盖超时、竞争、抢占、幂等、依赖编排、
+                           统一积压配额、恢复
 ```
 
 ## 任务状态机
@@ -29,11 +30,14 @@ PENDING ──> ASSIGNED ──> RUNNING ──> SUCCEEDED (终态)
 ASSIGNED/RUNNING ──回收且次数用尽──> FAILED
 任意非终态 ──> CANCELLED (终态)
 
-依赖编排扩展：
+依赖编排扩展（WAITING_DEPS / BLOCKED 与 PENDING / PREEMPTED 共用同一份
+max_backlog 配额，状态互转不改变配额计数）：
 WAITING_DEPS ──依赖全部成功──> PENDING
 WAITING_DEPS ──前置失败/取消──> BLOCKED (记录 blocked_by)
 BLOCKED ──前置恢复(重试/解阻)──> WAITING_DEPS
-WAITING_DEPS / BLOCKED ──> CANCELLED
+WAITING_DEPS / BLOCKED ──> CANCELLED (释放槽位)
+FAILED ──retry(需有空槽)──> PENDING
+ASSIGNED/RUNNING ──preempt(需有空槽)──> PREEMPTED
 ```
 
 - 非法跳转（如 ASSIGNED→SUCCEEDED、PENDING→RUNNING）抛出
@@ -70,8 +74,16 @@ WAITING_DEPS / BLOCKED ──> CANCELLED
   其优先级必须严格更高。被抢占任务进入 PREEMPTED 并保留 `progress`，
   可被重新领取续执行。失败原因可区分：`mission_not_preemptible` /
   `preempt_target_not_running` / `preempt_priority_too_low`。
-- 积压控制：PENDING + PREEMPTED 数量达到 `max_backlog` 时新任务被拒绝
-  （`backlog_full`, HTTP 429），不无界占用资源。
+- 积压控制（统一配额）：`max_backlog` 限制的是**所有"已接收但未在执行"的
+  任务总数**，即 `PENDING + PREEMPTED + WAITING_DEPS + BLOCKED` 四类状态
+  共享同一份配额。达到上限时新任务被拒绝（`backlog_full`, HTTP 429），
+  等待依赖的任务和被前置拖住而不可执行的任务同样占用配额，等待池不会
+  无界堆积。执行态（ASSIGNED/RUNNING）与终态
+  （SUCCEEDED/FAILED/CANCELLED）不占配额；任务进入终态（含取消一个
+  WAITING_DEPS/BLOCKED 任务）即释放槽位。
+  唯一例外是租约回收（见下）：持有者失活后强制把未用尽次数的任务退回
+  PENDING，此安全路径不可拒绝，可能瞬时达到 `max_backlog+1`，但领取一个
+  任务即自愈，且该期间新提交仍按上限拒绝。
 
 ## 任务依赖编排
 
@@ -94,10 +106,28 @@ WAITING_DEPS / BLOCKED ──> CANCELLED
 - 阻断恢复：前置经重试回到等待并最终成功时，被阻断的任务按同样规则
   恢复（`BLOCKED -> WAITING_DEPS -> PENDING`）。所有依赖状态刷新在
   同一把锁内随触发操作同事务持久化，无半更新、无自相矛盾的可见状态。
-- 容量约束：解阻晋升 `PENDING` 与下发共用同一 `max_backlog` 上限。
-  一个前置成功同时解阻一批任务时，按入队序号逐个晋升，槽位不足的任务
-  留在 `WAITING_DEPS` 排队（下次释放槽位时再评估），不得绕开上限
-  无界堆积。
+- 容量约束（等待/阻断/重试分别如何计入配额）：
+  - **等待依赖（WAITING_DEPS）**：提交时即占用一个积压槽位，与 PENDING
+    完全等价地计数。因此把 `max_backlog` 调到很小（如 3）后，连续下发
+    大量"依赖某个还没出现的任务"的任务，只有前 3 个被接收，其余明确
+    拒绝 `backlog_full`，不留下半截记录。
+  - **被前置拖住（BLOCKED）**：前置 FAILED/CANCELLED 导致任务不可执行时，
+    它只是在同一个已占用的槽位上从 WAITING_DEPS 换成 BLOCKED（阻断沿链
+    传播同理），计数不增不减；依赖一个"已取消、永不完成"前置的新任务在
+    提交时即为 BLOCKED，同样先过配额检查。前置恢复（重试）时
+    `BLOCKED -> WAITING_DEPS` 也只是同槽换状态。
+  - **解阻晋升 PENDING**：前置成功同时放开一批任务时，等待者从提交起就
+    一直占着槽位，`WAITING_DEPS -> PENDING` 不改变计数，因此一批任务
+    同时具备执行条件也不会把待分配集合撑到上限之上。容量在提交这一步
+    已被精确预留，不存在"解阻时队列被别的任务占满而无限排队/饿死"。
+  - **重试回到待分配**：FAILED 是终态、不占配额，因此 `retry` 让任务回到
+    PENDING 前必须重新通过配额检查，满队时拒绝 `backlog_full`，任务保持
+    FAILED（次数校验优先）。
+  - **抢占回到待分配**：ASSIGNED/RUNNING 不占配额，被抢占进入 PREEMPTED
+    前同样检查配额，满队时拒绝，任务继续留在执行态、租约不受影响。
+  - 所有检查都在状态变更**之前**、同一把锁内完成；放开（完成/失败/取消/
+    重试触发的依赖刷新）与领取并发时由锁串行化，不会出现瞬时超限、重复
+    分配或自相矛盾的状态。
 - 幂等：`depends_on` 参与内容指纹。同标识同依赖重复下发幂等返回首次
   结果；依赖不同按 `mission_payload_conflict` 拒绝。
 - 持久化：`depends_on` / `blocked_by` / 新状态均随任务记录持久化，
@@ -110,6 +140,9 @@ WAITING_DEPS / BLOCKED ──> CANCELLED
 | `lease_duration_s` | 30 | [1, 3600] |
 | `heartbeat_timeout_s` | 15 | [1, 3600] |
 | `max_backlog` | 1000 | [1, 100000] |
+
+`max_backlog` 是统一积压配额：统计 `PENDING + PREEMPTED + WAITING_DEPS +
+BLOCKED` 四类"已接收未执行"任务；执行态与终态不计。
 | `max_attempts_default` | 3 | [1, 100] |
 | `max_lease_renewals` | 10 | [0, 1000] |
 | `renew_extension_s` | 30 | [1, 3600] |
@@ -125,6 +158,9 @@ WAITING_DEPS / BLOCKED ──> CANCELLED
   事件）。事件日志尾部半行（崩溃截断）被安全忽略。
 - 重放结果与快照一致由 `tests/test_recovery.py` 验证；回收过的租约不会在
   重启后复活，不产生幽灵任务或重复分配。
+- 统一积压配额在重启/重放后口径不变：WAITING_DEPS/BLOCKED 记录随状态完整
+  恢复并继续占用槽位，不会凭空多出可领取任务；老记录（无 `depends_on` /
+  `blocked_by` 字段）缺省视为无依赖的 PENDING，行为不变。
 
 ## 数据格式演进
 
@@ -152,10 +188,16 @@ WAITING_DEPS / BLOCKED ──> CANCELLED
 ## 验证方法
 
 ```bash
-uv run pytest tests/ -q          # 全部 64 个测试
+uv run pytest tests/ -q          # 全部 76 个测试
 uv run pytest tests/ -q -s       # 打印每个用例的输入与判定依据 ([CASE] 日志)
 uv run uvicorn main:app          # 启动服务，文档见 /docs
 ```
+
+手工验证统一配额（以 `max_backlog=3` 为例）：连续下发 20 个
+`depends_on=["不存在的前置"]` 的任务，只有 3 个进入 WAITING_DEPS，
+其余返回 `{"error":"backlog_full"}`（HTTP 429）；依赖一个已取消前置的
+任务同理（进入 BLOCKED 且占槽）。重试 / 抢占回待分配在满队时同样被
+`backlog_full` 拒绝；前置成功一次性放开一批任务不会突破上限。
 
 测试主题与文件对应：
 
@@ -168,7 +210,8 @@ uv run uvicorn main:app          # 启动服务，文档见 /docs
 | 注册、能力与可用性 | `tests/test_robot_registration.py` |
 | 非法跳转与非持有者上报 | `tests/test_state_machine.py` |
 | 重启恢复与事件重放 | `tests/test_recovery.py` |
-| 依赖编排（等待/阻断/成环/容量/重放） | `tests/test_dependencies.py` |
+| 依赖编排（等待/阻断/成环/解阻/重放） | `tests/test_dependencies.py` |
+| 统一积压配额（等待/阻断/重试/抢占、放开并发、回收自愈、重启） | `tests/test_backlog_quota.py` |
 | 配置校验 | `tests/test_config.py` |
 | 数据格式演进 | `tests/test_evolution.py` |
 | HTTP 拒绝原因映射 | `tests/test_api.py` |

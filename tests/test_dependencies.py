@@ -7,6 +7,7 @@ import threading
 import pytest
 
 from fleet_orchestrator.errors import (
+    BacklogFull,
     DependencyCycle,
     MissionNotAssignable,
     MissionPayloadConflict,
@@ -253,31 +254,67 @@ def test_concurrent_unblock_and_acquire(service, case_log):
 # ---- 解阻过程仍遵守容量上限 ----
 
 def test_unblock_respects_backlog_cap(store, clock, small_config, case_log):
-    svc = OrchestratorService(store, config=small_config(max_backlog=2), clock=clock)
+    """新配额口径：WAITING_DEPS 在提交时已占用积压槽位，解阻为 PENDING
+    只是同槽换状态，不增加计数。即使队列被其他 PENDING 任务填满，
+    前置完成时一批等待任务仍全部晋升，不会把待分配集合撑到上限之上
+    （它们本来就在计数内）。"""
+    svc = OrchestratorService(store, config=small_config(max_backlog=3), clock=clock)
     svc.register_robot("r1", [])
+    svc.register_robot("r2", [])
     svc.submit_mission("dep")
     svc.submit_mission("m1", depends_on=["dep"])
-    svc.submit_mission("m2", depends_on=["dep"])
-    svc.submit_mission("filler1")
+    svc.submit_mission("m2", depends_on=["dep"])  # dep+m1+m2 共占 3 槽，已满
     _, lease = svc.acquire_mission("r1", "dep")  # dep 离队列，腾出一个槽位
-    svc.submit_mission("filler2")                # filler1+filler2 = 积压 2，已满
+    svc.submit_mission("filler")                # m1+m2+filler = 积压 3，已满
     svc.start_mission("r1", "dep", lease.lease_id)
     svc.complete_mission("r1", "dep", lease.lease_id)
     s1, s2 = svc.get_mission("m1").status, svc.get_mission("m2").status
-    case_log("容量已满时解阻", input="max_backlog=2 且被 filler 占满",
-             expect="m1/m2 不因依赖完成绕开上限，留在 WAITING_DEPS 排队",
-             actual=f"m1={s1} m2={s2}")
-    assert s1 == MissionStatus.WAITING_DEPS
-    assert s2 == MissionStatus.WAITING_DEPS
-    # 释放一个槽位后，按入队序号只晋升一个
-    svc.acquire_mission("r1", "filler1")
-    s1, s2 = svc.get_mission("m1").status, svc.get_mission("m2").status
-    case_log("释放一个槽位", expect="仅 m1 晋升 PENDING，m2 仍排队",
-             actual=f"m1={s1} m2={s2}")
+    backlog = svc._backlog_size()
+    case_log("容量已满时解阻", input="max_backlog=3, filler 占着可领取队列",
+             expect="m1/m2 同槽换状态全部晋升 PENDING，计数不超过上限",
+             actual=f"m1={s1} m2={s2} backlog={backlog}")
     assert s1 == MissionStatus.PENDING
-    assert s2 == MissionStatus.WAITING_DEPS
-    with pytest.raises(MissionNotAssignable):
-        svc.acquire_mission("r1", "m2")
+    assert s2 == MissionStatus.PENDING
+    assert backlog == 3
+    # 待分配集合（可领取）= m1/m2/filler，未超过上限
+    acquirable = {
+        m.mission_id
+        for m in svc.list_missions()
+        if m.status in (MissionStatus.PENDING, MissionStatus.PREEMPTED)
+    }
+    assert acquirable == {"m1", "m2", "filler"}
+    # 三台设备各领一个，不会出现瞬时超限或重复分配
+    picked = set()
+    for rid in ("r1", "r2"):
+        m, _ = svc.acquire_mission(rid)
+        picked.add(m.mission_id)
+    assert picked <= {"m1", "m2", "filler"} and len(picked) == 2
+
+
+def test_batch_unblock_at_cap_still_bounded(store, clock, small_config, case_log):
+    """一个前置成功同时解阻一整批任务：全部占过槽，晋升后总数不变，
+    且新提交仍按上限拒绝（放开路径不会凭空制造容量）。"""
+    cap = 5
+    svc = OrchestratorService(store, config=small_config(max_backlog=cap), clock=clock)
+    svc.register_robot("r1", [])
+    svc.submit_mission("dep")
+    for i in range(cap - 1):
+        svc.submit_mission(f"w{i}", depends_on=["dep"])
+    assert svc._backlog_size() == cap
+    with pytest.raises(BacklogFull):
+        svc.submit_mission("extra", depends_on=["dep"])
+    _run_to_success(svc, "r1", "dep")
+    pending = [m.mission_id for m in svc.list_missions(MissionStatus.PENDING)]
+    case_log("一批同时解阻", input=f"1 个前置 + {cap - 1} 个等待者, 上限={cap}",
+             expect=f"{cap - 1} 个等待者全部 PENDING，计数仍为 {cap - 1}",
+             actual=f"pending={sorted(pending)} backlog={svc._backlog_size()}")
+    assert sorted(pending) == sorted(f"w{i}" for i in range(cap - 1))
+    assert svc._backlog_size() == cap - 1  # dep 已终态释放一槽
+    # 只剩一个槽位：放一个进来后再次拒绝
+    svc.submit_mission("one_more")
+    with pytest.raises(BacklogFull):
+        svc.submit_mission("two_more")
+
 
 
 # ---- 重放 / 重启后状态一致 ----
