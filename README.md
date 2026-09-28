@@ -14,7 +14,7 @@ fleet_orchestrator/
   models.py                领域模型与状态机跳转表（extra="allow" 容忍未知字段）
   config.py                调度/超时参数，范围校验，非法整体拒绝
   errors.py                可区分拒绝原因（每个 reason 稳定且唯一）
-tests/                     64 个测试，覆盖超时、竞争、抢占、幂等、依赖编排、恢复
+tests/                     72 个测试，覆盖超时、竞争、抢占、幂等、依赖编排、恢复
 ```
 
 ## 任务状态机
@@ -70,8 +70,11 @@ WAITING_DEPS / BLOCKED ──> CANCELLED
   其优先级必须严格更高。被抢占任务进入 PREEMPTED 并保留 `progress`，
   可被重新领取续执行。失败原因可区分：`mission_not_preemptible` /
   `preempt_target_not_running` / `preempt_priority_too_low`。
-- 积压控制：PENDING + PREEMPTED 数量达到 `max_backlog` 时新任务被拒绝
-  （`backlog_full`, HTTP 429），不无界占用资源。
+- 积压控制：所有"未终态且未持有租约"的任务共享同一份 `max_backlog`
+  配额——PENDING + PREEMPTED（等待调度）与 WAITING_DEPS + BLOCKED
+  （等待前置/被前置拖住）计入同一口径。配额占满时新任务被拒绝
+  （`backlog_full`, HTTP 429），等待池与阻断池都不能无界堆积。
+  各状态的计入规则详见"任务依赖编排"一节的容量约束。
 
 ## 任务依赖编排
 
@@ -94,10 +97,20 @@ WAITING_DEPS / BLOCKED ──> CANCELLED
 - 阻断恢复：前置经重试回到等待并最终成功时，被阻断的任务按同样规则
   恢复（`BLOCKED -> WAITING_DEPS -> PENDING`）。所有依赖状态刷新在
   同一把锁内随触发操作同事务持久化，无半更新、无自相矛盾的可见状态。
-- 容量约束：解阻晋升 `PENDING` 与下发共用同一 `max_backlog` 上限。
-  一个前置成功同时解阻一批任务时，按入队序号逐个晋升，槽位不足的任务
-  留在 `WAITING_DEPS` 排队（下次释放槽位时再评估），不得绕开上限
-  无界堆积。
+- 容量约束：等待依赖（`WAITING_DEPS`）、被前置拖住（`BLOCKED`）的任务
+  与待分配任务（`PENDING`/`PREEMPTED`）占用**同一份** `max_backlog`
+  配额。具体口径：
+  - 下发：无论任务落为 `PENDING`、`WAITING_DEPS` 还是 `BLOCKED`，都先
+    检查配额，占满即拒绝 `backlog_full`（HTTP 429），不留半截记录；
+  - 解阻/阻断恢复（`WAITING_DEPS→PENDING`、`BLOCKED→WAITING_DEPS`）是
+    配额中性的状态迁移：前置完成一次性放开一批任务时，总量不变、不会
+    把积压撑过上限，也不会因配额被等待任务占满而卡死晋升；
+  - 失败重试（`FAILED→PENDING`）是新增占用（终态不占配额），与下发
+    共用同一条上限，超限拒绝 `backlog_full`，任务保持 `FAILED`，容量
+    释放后可再次发起；
+  - 领取/终态退出释放配额，回收/抢占归还配额，收支相抵，总量始终
+    受控。所有放开路径与领取动作在同一把锁内串行，并发竞争下不会
+    瞬时超限或重复分配。
 - 幂等：`depends_on` 参与内容指纹。同标识同依赖重复下发幂等返回首次
   结果；依赖不同按 `mission_payload_conflict` 拒绝。
 - 持久化：`depends_on` / `blocked_by` / 新状态均随任务记录持久化，
@@ -152,8 +165,9 @@ WAITING_DEPS / BLOCKED ──> CANCELLED
 ## 验证方法
 
 ```bash
-uv run pytest tests/ -q          # 全部 64 个测试
+uv run pytest tests/ -q          # 全部 72 个测试
 uv run pytest tests/ -q -s       # 打印每个用例的输入与判定依据 ([CASE] 日志)
+uv run pytest tests/test_backlog_cap.py -q -s   # 专项：积压上限对等待池/阻断/重试的约束
 uv run uvicorn main:app          # 启动服务，文档见 /docs
 ```
 
@@ -169,6 +183,7 @@ uv run uvicorn main:app          # 启动服务，文档见 /docs
 | 非法跳转与非持有者上报 | `tests/test_state_machine.py` |
 | 重启恢复与事件重放 | `tests/test_recovery.py` |
 | 依赖编排（等待/阻断/成环/容量/重放） | `tests/test_dependencies.py` |
+| 积压上限与等待池（等待/阻断/重试占配额、并发放开、重放一致） | `tests/test_backlog_cap.py` |
 | 配置校验 | `tests/test_config.py` |
 | 数据格式演进 | `tests/test_evolution.py` |
 | HTTP 拒绝原因映射 | `tests/test_api.py` |

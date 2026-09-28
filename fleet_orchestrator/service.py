@@ -178,10 +178,24 @@ class OrchestratorService:
     # ---------- 依赖编排 ----------
 
     def _backlog_size(self) -> int:
+        """积压配额占用：所有"未终态且未持有租约"的任务共享同一份配额。
+
+        计入 PENDING / PREEMPTED（等待调度）与 WAITING_DEPS / BLOCKED
+        （等待前置、被前置拖住）：等待池与待分配队列是同一份配额，
+        防止依赖等待/阻断任务绕开 max_backlog 无界堆积。
+        ASSIGNED/RUNNING 不占用配额（槽位在领取时释放、回收/抢占时归还，
+        收支相抵）；终态不占配额。
+        """
         return sum(
             1
             for m in self._missions.values()
-            if m.status in (MissionStatus.PENDING, MissionStatus.PREEMPTED)
+            if m.status
+            in (
+                MissionStatus.PENDING,
+                MissionStatus.PREEMPTED,
+                MissionStatus.WAITING_DEPS,
+                MissionStatus.BLOCKED,
+            )
         )
 
     def _would_cycle(self, mission_id: str, deps: list[str]) -> bool:
@@ -226,8 +240,13 @@ class OrchestratorService:
 
         1) 阻断传播与恢复迭代至不动点（阻断可沿依赖链传递）：
            WAITING_DEPS 有失败前置 -> BLOCKED；BLOCKED 无失败前置 -> WAITING_DEPS。
-        2) 解除等待：依赖全部成功且积压未满 -> PENDING；
-           容量不足时留在 WAITING_DEPS 排队，不得绕开 max_backlog。
+        2) 解除等待：依赖全部成功 -> PENDING。
+
+        容量说明：WAITING_DEPS/BLOCKED 与 PENDING 占用同一份积压配额，
+        晋升（WAITING_DEPS -> PENDING）与解阻（BLOCKED -> WAITING_DEPS）
+        都是配额中性的状态迁移，不会把积压撑过 max_backlog——上限由
+        下发/重试等"新增占用"入口统一把守，此处无需也不应再设闸门
+        （否则配额被等待任务占满时会永久卡死晋升）。
         """
         events: list[tuple[str, dict[str, Any]]] = []
         ordered = sorted(self._missions.values(), key=lambda m: m.enqueue_seq)
@@ -248,16 +267,12 @@ class OrchestratorService:
                         self._transition(m, MissionStatus.WAITING_DEPS)
                         events.append(("mission_upsert", m.model_dump(mode="json")))
                         changed = True
-        backlog = self._backlog_size()
         for m in ordered:
             if m.status != MissionStatus.WAITING_DEPS:
                 continue
             if not self._deps_satisfied(m):
                 continue
-            if backlog >= self._config.max_backlog:
-                continue  # 容量不足：留在 WAITING_DEPS 排队，下次刷新再评估
             self._transition(m, MissionStatus.PENDING)
-            backlog += 1
             events.append(("mission_upsert", m.model_dump(mode="json")))
         return events
 
@@ -350,6 +365,9 @@ class OrchestratorService:
                 raise DependencyCycle(
                     f"mission {mission_id!r} dependencies form a cycle: {deps}"
                 )
+            # 容量检查在建任务之前：拒绝不留半截记录。
+            # 等待前置（WAITING_DEPS）与被阻断（BLOCKED）的任务同样占配额，
+            # 等待池不能绕开 max_backlog 无界堆积。
             backlog = self._backlog_size()
             if backlog >= self._config.max_backlog:
                 raise BacklogFull(
@@ -513,6 +531,15 @@ class OrchestratorService:
                 raise RetriesExhausted(
                     f"mission {mission_id!r} attempts {mission.attempts}"
                     f" >= max_attempts {mission.max_attempts}"
+                )
+            # FAILED 是终态不占配额，回到 PENDING 是新增占用：
+            # 与下发共用同一条上限，超限按既有策略拒绝（任务保持 FAILED，
+            # 容量释放后可再次发起重试），不留半截状态。
+            backlog = self._backlog_size()
+            if backlog >= self._config.max_backlog:
+                raise BacklogFull(
+                    f"backlog {backlog} >= max_backlog {self._config.max_backlog},"
+                    f" retry of {mission_id!r} rejected"
                 )
             self._transition(mission, MissionStatus.PENDING)
             self._persist(
